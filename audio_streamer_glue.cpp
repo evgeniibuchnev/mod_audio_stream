@@ -836,6 +836,24 @@ extern "C" {
         return SWITCH_STATUS_SUCCESS;
     }
 
+    switch_status_t stream_session_flush(switch_core_session_t *session) {
+        switch_channel_t *channel = switch_core_session_get_channel(session);
+        auto *bug = (switch_media_bug_t*) switch_channel_get_private(channel, MY_BUG_NAME);
+        if (!bug) {
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_ERROR, "stream_session_flush failed because no bug\n");
+            return SWITCH_STATUS_FALSE;
+        }
+        auto *tech_pvt = (private_t*) switch_core_media_bug_get_user_data(bug);
+        if (!tech_pvt) return SWITCH_STATUS_FALSE;
+
+        switch_mutex_lock(tech_pvt->write_mutex);
+        switch_buffer_zero(tech_pvt->write_sbuffer);
+        switch_mutex_unlock(tech_pvt->write_mutex);
+
+        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "stream_session_flush: write buffer cleared\n");
+        return SWITCH_STATUS_SUCCESS;
+    }
+
     switch_status_t stream_session_init(switch_core_session_t *session,
                                         responseHandler_t responseHandler,
                                         uint32_t samples_per_second,
