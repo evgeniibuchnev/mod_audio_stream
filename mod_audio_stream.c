@@ -144,6 +144,12 @@ static switch_status_t do_pauseresume(switch_core_session_t *session, int pause)
     return status;
 }
 
+static switch_status_t do_flush(switch_core_session_t *session)
+{
+    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "mod_audio_stream: flush\n");
+    return stream_session_flush(session);
+}
+
 static switch_status_t send_text(switch_core_session_t *session, char *text)
 {
     switch_status_t status = SWITCH_STATUS_FALSE;
@@ -162,7 +168,7 @@ static switch_status_t send_text(switch_core_session_t *session, char *text)
     return status;
 }
 
-#define STREAM_API_SYNTAX "<uuid> [start | stop | send_text | pause | resume | graceful-shutdown ] [wss-url | path] [mono | mixed | stereo] [8000 | 16000] [metadata]"
+#define STREAM_API_SYNTAX "<uuid> [start | stop | send_text | pause | resume | flush | graceful-shutdown ] [wss-url | path] [mono | mixed | stereo] [8000 | 16000] [metadata]"
 SWITCH_STANDARD_API(stream_function)
 {
     char *mycmd = NULL, *argv[6] = {0};
@@ -206,6 +212,10 @@ SWITCH_STANDARD_API(stream_function)
             else if (!strcasecmp(argv[1], "resume"))
             {
                 status = do_pauseresume(lsession, 0);
+            }
+            else if (!strcasecmp(argv[1], "flush"))
+            {
+                status = do_flush(lsession);
             }
             else if (!strcasecmp(argv[1], "send_text"))
             {
@@ -337,6 +347,7 @@ SWITCH_MODULE_LOAD_FUNCTION(mod_audio_stream_load)
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid stop");
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid pause");
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid resume");
+    switch_console_set_complete("add uuid_audio_stream ::console::list_uuid flush");
     switch_console_set_complete("add uuid_audio_stream ::console::list_uuid send_text");
 
     switch_log_printf(SWITCH_CHANNEL_LOG, SWITCH_LOG_NOTICE, "mod_audio_stream API successfully loaded\n");
