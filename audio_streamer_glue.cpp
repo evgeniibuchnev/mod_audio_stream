@@ -595,7 +595,13 @@ namespace {
                 if (available >= bytes) {
                     write_frame.datalen = (uint32_t)switch_buffer_read(tech_pvt->write_sbuffer, write_frame.data, bytes);
                     write_frame.samples = write_frame.datalen / 2 / channels;
-                    switch_core_session_write_frame(session, &write_frame, SWITCH_IO_FLAG_NONE, 0);
+                    /* Only write when the channel is still live. Skipping this check is the
+                       root cause of the hung-session bug: switch_core_session_write_frame()
+                       blocks acquiring the session I/O lock while the session teardown path
+                       holds it, causing a deadlock with stream_session_cleanup(). */
+                    if (switch_channel_ready(channel)) {
+                        switch_core_session_write_frame(session, &write_frame, SWITCH_IO_FLAG_NONE, 0);
+                    }
                 }
                 switch_mutex_unlock(tech_pvt->write_mutex);
             }
@@ -1151,16 +1157,49 @@ extern "C" {
             }
 
             if (write_thread) {
-                switch_status_t thread_status = SWITCH_STATUS_SUCCESS;
-                switch_status_t join_result = switch_thread_join(&thread_status, write_thread);
-                if (join_result != SWITCH_STATUS_SUCCESS) {
-                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
-                                      "(%s) stream_session_cleanup: failed to join write thread (%d)\n",
-                                      sessionId, join_result);
+                if (!channelIsClosing) {
+                    /* Explicit stop (uuid_audio_stream stop, etc.): safe to join because
+                       we are NOT in the session teardown path, so write_frame_thread can
+                       still call switch_core_session_write_frame() without deadlocking. */
+                    switch_status_t thread_status = SWITCH_STATUS_SUCCESS;
+                    switch_status_t join_result = switch_thread_join(&thread_status, write_thread);
+                    if (join_result != SWITCH_STATUS_SUCCESS) {
+                        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_WARNING,
+                                          "(%s) stream_session_cleanup: failed to join write thread (%d)\n",
+                                          sessionId, join_result);
+                    }
+                } else {
+                    /* Far-end hangup path (channelIsClosing=1): called from SWITCH_ABC_TYPE_CLOSE
+                       while the FreeSWITCH session teardown holds the session I/O lock.
+                       Joining here would deadlock: write_frame_thread blocks inside
+                       switch_core_session_write_frame() waiting for that same lock.
+                       close_requested=1 (set above) causes the write thread to exit its loop
+                       within one timer tick (~20ms); switch_channel_ready() guards the actual
+                       write call so it never blocks on a dead channel. The thread exits safely
+                       before the session pool is freed. */
+                    switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_DEBUG,
+                                      "(%s) stream_session_cleanup: skipping write thread join on channel close "
+                                      "(close_requested set, thread will self-exit)\n", sessionId);
                 }
             }
 
-            destroy_tech_pvt(tech_pvt);
+            if (!channelIsClosing) {
+                /* Full cleanup when we own the teardown. */
+                destroy_tech_pvt(tech_pvt);
+            } else {
+                /* Channel-closing path: only free heap-allocated resources.
+                   Pool-allocated objects (write_sbuffer, write_mutex, etc.) must remain
+                   valid until the write thread exits; they will be reclaimed with the
+                   session pool, which is freed after all callbacks complete. */
+                if (tech_pvt->read_resampler) {
+                    speex_resampler_destroy(tech_pvt->read_resampler);
+                    tech_pvt->read_resampler = nullptr;
+                }
+                if (tech_pvt->write_resampler) {
+                    speex_resampler_destroy(tech_pvt->write_resampler);
+                    tech_pvt->write_resampler = nullptr;
+                }
+            }
 
             switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "(%s) stream_session_cleanup: connection closed\n", sessionId);
             return SWITCH_STATUS_SUCCESS;
