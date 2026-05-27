@@ -10,6 +10,7 @@
 #include <vector>
 #include <memory>
 #include <mutex>
+#include <thread>
 #include "base64.h"
 
 #define FRAME_SIZE_8000  320 /* 1000x0.02 (20ms)= 160 x(16bit= 2 bytes) 320 frame size*/
@@ -1152,8 +1153,29 @@ extern "C" {
                 streamer->deleteFiles();
                 if (text) streamer->writeText(text);
 
+                /* markCleanedUp() nulls all callbacks first so no websocket
+                   event can fire into session context after this point. */
                 streamer->markCleanedUp();
-                streamer->disconnect();
+
+                if (!channelIsClosing) {
+                    /* Explicit stop (uuid_audio_stream stop): safe to
+                       disconnect synchronously - not in the session teardown
+                       path so there is no risk of blocking FreeSWITCH. */
+                    streamer->disconnect();
+                } else {
+                    /* Far-end hangup path: disconnect() performs a blocking
+                       WebSocket close handshake - it sends a CLOSE frame and
+                       waits for the server's response.  If the AI backend is
+                       slow or already gone this blocks indefinitely, which
+                       is the root cause of the hung session after our first
+                       fix removed the switch_thread_join deadlock.
+                       Move it to a detached thread so the session teardown
+                       path returns immediately.  The shared_ptr keeps the
+                       AudioStreamer alive until disconnect() completes. */
+                    std::thread([s = std::move(streamer)]() mutable {
+                        s->disconnect();
+                    }).detach();
+                }
             }
 
             if (write_thread) {
