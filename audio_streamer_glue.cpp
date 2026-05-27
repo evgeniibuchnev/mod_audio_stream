@@ -308,6 +308,15 @@ private:
         size_t remaining = bytes_out;
         const uint8_t *ptr = reinterpret_cast<const uint8_t *>(out_buf.data());
         while (remaining > 0) {
+            /* Bail out immediately if teardown has started.  Once close_requested
+               is set the write_frame_thread exits within one timer tick (~20 ms)
+               and stops draining write_sbuffer.  Spinning here with the session
+               read-lock held (from switch_core_session_locate in eventCallback)
+               would prevent FreeSWITCH from write-locking the session for
+               destruction, causing a permanent hung session. */
+            if (tech_pvt->close_requested || tech_pvt->cleanup_started) {
+                break;
+            }
             switch_size_t free_space = switch_buffer_freespace(tech_pvt->write_sbuffer);
             if (free_space == 0) {
                 switch_mutex_unlock(tech_pvt->write_mutex);
@@ -364,7 +373,16 @@ private:
 
             case MESSAGE:
                 if (pr.isRawAudio) {
-                    injectRawAudio(psession, pr.rawAudio, pr.sampleRate);
+                    /* Guard against injecting audio on a dying channel.
+                       switch_channel_ready() returns false once hangup begins,
+                       so we avoid entering injectRawAudio when write_frame_thread
+                       has already stopped draining the buffer. */
+                    {
+                        switch_channel_t *ch = switch_core_session_get_channel(psession);
+                        if (ch && switch_channel_ready(ch)) {
+                            injectRawAudio(psession, pr.rawAudio, pr.sampleRate);
+                        }
+                    }
                 } else if (pr.ok == SWITCH_TRUE) {
                     m_notify(psession, EVENT_PLAY, msg.c_str());
                 } else {
