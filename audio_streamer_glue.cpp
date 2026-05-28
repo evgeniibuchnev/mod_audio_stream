@@ -158,6 +158,7 @@ private:
         bool isRawAudio = false;
         int sampleRate = 0;
         std::vector<uint8_t> rawAudio;
+        bool isFlush = false;   // {"type":"flush"} in-band flush request
     };
 
     static inline void push_err(ProcessResult& out, const std::string& sid, const std::string& s) {
@@ -372,7 +373,26 @@ private:
                 break;
 
             case MESSAGE:
-                if (pr.isRawAudio) {
+                if (pr.isFlush) {
+                    /* In-band flush: processed in WebSocket message order, so every
+                       audio packet sent before this message has already been injected
+                       into write_sbuffer.  Clear it now so none of that audio plays. */
+                    auto *bug = get_media_bug(psession);
+                    if (bug) {
+                        auto *tech_pvt = (private_t *)switch_core_media_bug_get_user_data(bug);
+                        if (tech_pvt && tech_pvt->write_mutex && tech_pvt->write_sbuffer) {
+                            switch_mutex_lock(tech_pvt->write_mutex);
+                            switch_size_t flushed = switch_buffer_inuse(tech_pvt->write_sbuffer);
+                            switch_buffer_zero(tech_pvt->write_sbuffer);
+                            switch_mutex_unlock(tech_pvt->write_mutex);
+                            uint32_t bps = tech_pvt->sampling * 2 * (uint32_t)tech_pvt->channels;
+                            double ms = bps > 0 ? (double)flushed * 1000.0 / bps : 0.0;
+                            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_INFO,
+                                "in-band flush: cleared %zu bytes (%.1f ms) from write buffer\n",
+                                flushed, ms);
+                        }
+                    }
+                } else if (pr.isRawAudio) {
                     /* Guard against injecting audio on a dying channel.
                        switch_channel_ready() returns false once hangup begins,
                        so we avoid entering injectRawAudio when write_frame_thread
@@ -390,7 +410,7 @@ private:
                     m_notify(psession, EVENT_JSON, msg.c_str());
                 }
 
-                if (!m_suppress_log && !pr.isRawAudio) {
+                if (!m_suppress_log && !pr.isRawAudio && !pr.isFlush) {
                     switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(psession), SWITCH_LOG_DEBUG,
                                     "response: %s\n", msg.c_str());
                 }
@@ -412,7 +432,16 @@ private:
         if (!root) return out;
 
         const char* jsonType = cJSON_GetObjectCstr(root.get(), "type");
-        if (!jsonType || std::strcmp(jsonType, "streamAudio") != 0) {
+        if (!jsonType) return out;
+
+        // In-band flush: clear write_sbuffer in WebSocket message order,
+        // so it fires after every audio packet preceding it in the TCP stream.
+        if (std::strcmp(jsonType, "flush") == 0) {
+            out.isFlush = true;
+            return out;
+        }
+
+        if (std::strcmp(jsonType, "streamAudio") != 0) {
             return out; // not ours
         }
 
@@ -872,10 +901,17 @@ extern "C" {
         if (!tech_pvt) return SWITCH_STATUS_FALSE;
 
         switch_mutex_lock(tech_pvt->write_mutex);
+        switch_size_t flushed_bytes = switch_buffer_inuse(tech_pvt->write_sbuffer);
         switch_buffer_zero(tech_pvt->write_sbuffer);
         switch_mutex_unlock(tech_pvt->write_mutex);
 
-        switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO, "stream_session_flush: write buffer cleared\n");
+        {
+            uint32_t bps = tech_pvt->sampling * 2 * (uint32_t)tech_pvt->channels; /* bytes/sec */
+            double ms = bps > 0 ? (double)flushed_bytes * 1000.0 / bps : 0.0;
+            switch_log_printf(SWITCH_CHANNEL_SESSION_LOG(session), SWITCH_LOG_INFO,
+                "stream_session_flush: cleared %zu bytes (%.1f ms) from write buffer\n",
+                flushed_bytes, ms);
+        }
         return SWITCH_STATUS_SUCCESS;
     }
 
